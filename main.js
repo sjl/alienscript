@@ -1,3 +1,53 @@
+//  _______ _  _                              _
+// (_______) |(_)                            (_)       _
+//  _______| | _ _____ ____   ___  ____  ____ _ ____ _| |_
+// |  ___  | || | ___ |  _ \ /___)/ ___)/ ___) |  _ (_   _)
+// | |   | | || | ____| | | |___ ( (___| |   | | |_| || |_
+// |_|   |_|\_)_|_____)_| |_(___/ \____)_|   |_|  __/  \__)
+// Copyright 2013 Steve Losh & contributors    |_|
+//
+// If you're reading this you're probably wondering how this all works.  It's
+// not pretty but here it is.
+//
+// In a nutshell, Alienscript compilation happens like this:
+//
+// 1. Read a file of Alienscript code into a big 'ol String of text
+// 2. Parse that String with Jison to get a series of "Abstract Syntax Shrubs":
+//    Javascript data structures representing the sexps inside.
+// 3. For each shrub:
+//    A. "Grow" the ASS into a Javascript Abstract Syntax Tree by massaging the
+//       sexp into an Object suitable for passing to escodegen.
+//    B. Pass the AST to escodegen to get a hunk of text back representing the
+//       Javascript code.
+//    C. Write that code to standard out (or a file or whatever).
+//    D. Evaluate the code (this is important for real macros, if you don't
+//       understand why, turn back now).
+//
+//  So for example, if we have an Alienscript file with:
+//
+//      (+ 1 2)
+//
+//  We read that file into a String:
+//
+//      '(+ 1 2)'
+//
+//  We parse that into an ASS:
+//
+//      [Symbol("+"), 1, 2]
+//
+//  Then we grow that ASS into an AST:
+//
+//      { type: "BinaryExpression", operator: "+",
+//        left: { type: "Literal", value: 1 },
+//        right: { type: "Literal", value: 2 } }
+//
+//  Then we send that to escodegen and get a String of Javascript code back:
+//
+//      '1 + 2'
+//
+//  Then we write that string to the destination (stdout, file, whatever) AND
+//  evaluate it before moving on.
+
 var vm = require('vm');
 var fs = require('fs');
 var util = require('util');
@@ -55,21 +105,24 @@ var apply = function(fn, args) {
     return fn.apply(null, args);
 };
 
-// Macro definitions ----------------------------------------------------------
-var macros = {
-    "defn": function(name, args, body) {
-        return [new Symbol('def'), name, [new Symbol('fn'), args, body]];
-    }
-};
+// Macro storage --------------------------------------------------------------
+var macros = {};
 
 // Special form definitions ---------------------------------------------------
+//
+// Special forms are built into the language.  They receive the rest of the ASS
+// *before* it's grown into an AST, so they have the chance to hack at it
+// (unlike primitives).
+//
+// Very few things need this level of power.  Most things can be done as
+// primitives, which are a bit less powerful.
 var special_forms = {
     "fn": function(elements) {
         var args = elements[0];
         var body = slice(elements, 1);
 
-        args = map(eval, args);
-        body = map(eval, body);
+        args = map(grow, args);
+        body = map(grow, body);
 
         var prereturn = poplast(body);
         var to_return = last(body);
@@ -88,48 +141,44 @@ var special_forms = {
                  params: args,
                  defaults: [], rest: null, generator: false, expression: false };
     },
-    ".": function(elements) {
-        var obj = elements[0];
-        var method = elements[1];
-        var args = slice(elements, 2);
-
-        obj = eval(obj);
-        args = map(eval, args);
-        method = { type: "Literal", value: eval(method).name };
-
-        return { type: "CallExpression", callee: {
-                    type: "MemberExpression", computed: true,
-                    object: obj, property: method,
-                 }, arguments: args };
-    },
-    "quote": function(elements) {
-        var q = elements[0];
-        console.log(q);
-        return q;
-    },
     "defmacro": function(elements) {
         var name = elements[0];
         var fnexpr = slice(elements, 1)
 
-        name = eval(name).name;
+        name = grow(name).name;
 
         return { type: "AssignmentExpression", operator: "=",
                  left: { type: "MemberExpression", computed: true,
                          object: { type: "Identifier", name: "macros" },
                          property: { type: "Literal", value: name } },
                  right: special_forms['fn'](fnexpr) };
-    },
-    "symbol": function(elements) {
-        var name = elements[0];
-        name = eval(name).name;
-        return { type: "NewExpression",
-                 callee: { type: "Identifier", name: "Symbol" },
-                 arguments: [{ type: "Literal", value: name }] };
     }
 };
 
 // Primitive definitions ------------------------------------------------------
+//
+// Primitives are built-in "functions" that are transformed directly into a JS
+// AST.  They differ from special forms in that they receive their arguments
+// pre-grown into ASTs.
 var primitives = {
+    ".": function(elements) {
+        var obj = elements[0];
+        var method = elements[1];
+        var args = slice(elements, 2);
+
+        method = { type: "Literal", value: method.name };
+
+        return { type: "CallExpression", callee: {
+                    type: "MemberExpression", computed: true,
+                    object: obj, property: method,
+                 }, arguments: args };
+    },
+    "symbol": function(elements) {
+        var name = elements[0].name;
+        return { type: "NewExpression",
+                 callee: { type: "Identifier", name: "Symbol" },
+                 arguments: [{ type: "Literal", value: name }] };
+    },
     "list": function(elements) {
         return { type: "ArrayExpression", elements: elements };
     },
@@ -293,30 +342,36 @@ var isASTHunkAnExpression = function(ast) {
     // Return whether the given hunk of JS AST (something like
     // { type: 'Literal', value: 10 }) is an "Expression" hunk.  Literals and
     // lots of other stuff are expressions, but things like variable
-    // declarations are not.  Fuck this bullshit language.
+    // declarations are not.
+    //
+    // Fuck this bullshit language.
     return contains(["Literal", "Identifier", "BinaryExpression",
                      "UnaryExpression", "ArrayExpression", "MemberExpression",
                      "ConditionalExpression", "FunctionExpression"],
                     ast.type);
 };
 
-// Eval -----------------------------------------------------------------------
-var evalSpecialForm = function(head, tail) {
+// Grow -----------------------------------------------------------------------
+//
+// grow* functions are responsible for growning an Alienscript Abstract Syntax
+// Shrub (ASS) into a Javascript Abstract Syntax Tree (AST).
+//
+// grow() is the main entry point here, and will take an arbitrary ASS and
+// transform it into an AST.
+var growSpecialForm = function(head, tail) {
     return special_forms[head.name](tail);
 };
-var evalPrimitive = function(head, tail) {
-    return primitives[head.name](map(eval, tail));
+var growPrimitive = function(head, tail) {
+    return primitives[head.name](map(grow, tail));
 };
-var evalMacro = function(head, tail) {
+var growMacro = function(head, tail) {
     return apply(macros[head.name], tail);
 };
-var evalApplication = function(head, tail) {
+var growApplication = function(head, tail) {
     return { type: "CallExpression",
-             callee: eval(head), arguments: map(eval, tail) };
+             callee: grow(head), arguments: map(grow, tail) };
 };
-var eval = function(sexp) {
-    // eval(sexp) takes the sexp and transforms it into a JS AST, suitable for
-    // use with escodegen
+var grow = function(sexp) {
     if (isNumber(sexp)) {
         if (sexp < 0) {
             // Are you fucking kidding me, escodegen?
@@ -336,46 +391,73 @@ var eval = function(sexp) {
         var tail = slice(sexp, 1);
 
         if (isPrimitive(head)) {
-            return evalPrimitive(head, tail);
+            return growPrimitive(head, tail);
         } else if (isSpecialForm(head)) {
-            return evalSpecialForm(head, tail);
+            return growSpecialForm(head, tail);
         } else if (isMacro(head)) {
-            return eval(evalMacro(head, tail));
+            return grow(growMacro(head, tail));
         } else {
-            return evalApplication(head, tail);
+            return growApplication(head, tail);
         }
     } else {
         return 'unknown';
     }
 };
 
-// Main -----------------------------------------------------------------------
+// Parse ----------------------------------------------------------------------
+//
+// parse() reads a given file of Alienscript code and parses it into an Abstract
+// Syntax Shrub (i.e.: series of sexps).
 var parse = function(filename) {
     return alienparse.parse(fs.readFileSync(filename, 'utf8'));
 };
-(function() {
-    var ast = parse(process.argv[2]);
 
-    // console.log('// alienscript ast ---------------------------------------');
-    // console.log(util.inspect(ast, false, null));
-
-    console.log('\n// JAVASCRIPT ------------------------------------------\n');
+// Main -----------------------------------------------------------------------
+var context = function() {
     var ctx = vm.createContext();
     ctx['console'] = console;
     ctx['macros'] = macros;
     ctx['Symbol'] = Symbol;
+    return ctx;
+}
+var compile = function(filename, ctx, verbose) {
+    if (verbose) {
+        console.log('// Parsing file ' + filename + ' -----------------------');
+    }
+
+    var ast = parse(filename);
+
+    if (verbose) {
+        console.log();
+        console.log('// Alienscript ASS ---------------------------------');
+        console.log(util.inspect(ast, false, null));
+        console.log();
+        console.log('// Javascript --------------------------------------');
+        console.log();
+    }
 
     for (var i = 0; i < ast.length; i++) {
-        var jsast = eval(ast[i]);
-        // console.log(util.inspect(jsast, false, null));
+        var jsast = grow(ast[i]);
+
+        if (verbose) {
+            console.log(util.inspect(jsast, false, null));
+        }
 
         var jscode = escodegen.generate(jsast);
+
         console.log(jscode);
 
         var result = vm.runInContext(jscode, ctx);
-        console.log("// => " + result);
 
+        if (verbose) {
+            console.log("// => " + result);
         console.log();
+        }
     }
+};
+(function() {
+    var ctx = context();
+    compile('stdlib.alien', ctx, true);
+    compile(process.argv[2], ctx, false);
 })();
 

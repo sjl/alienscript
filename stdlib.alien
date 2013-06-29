@@ -1,0 +1,5 @@
+(defmacro defn (name args body)
+  [(symbol def) name [(symbol fn) args body]])
+
+(defmacro when (cond body)
+  [(symbol if) cond body null])
